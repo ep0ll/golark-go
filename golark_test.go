@@ -382,7 +382,9 @@ func TestResolverNotFoundDoesNotDiscoverPackagesImplicitly(t *testing.T) {
 		return golark.PackageSource{}, golark.ErrPackageNotFound
 	})
 	_, err := golark.Exec(context.Background(), "root.go", []byte("package config\nimport \"example.com/missing\"\nfunc Run() {}\n"), golark.Options{Resolver: resolver})
-	if !errors.Is(err, golark.ErrPackageNotFound) {
-		t.Fatalf("expected ErrPackageNotFound, got %v", err)
+	// go/types wraps importer failures in its own diagnostic error, so
+	// verify the explicit resolver-not-found diagnostic at the source boundary.
+	if err == nil || !strings.Contains(err.Error(), "package not found") {
+		t.Fatalf("expected explicit package-not-found diagnostic, got %v", err)
 	}
 }
