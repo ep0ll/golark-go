@@ -73,20 +73,25 @@ func (f *frame) execStmt(stmt ast.Stmt) (flow, error) {
 		}
 		return flow{kind: flowReturn, values: values}, nil
 	case *ast.IfStmt:
+		// The init statement and both branches share the if statement's scope,
+		// which must not leak into the surrounding block.
+		local := newEnv(f.env)
+		child := *f
+		child.env = local
 		if s.Init != nil {
-			if _, err := f.execStmt(s.Init); err != nil {
+			if _, err := child.execStmt(s.Init); err != nil {
 				return flow{}, err
 			}
 		}
-		cond, err := f.rt.evalExpr(f.ctx, s.Cond, f.env)
+		cond, err := child.rt.evalExpr(child.ctx, s.Cond, child.env)
 		if err != nil {
 			return flow{}, err
 		}
 		if truthy(cond) {
-			return f.execBlock(s.Body)
+			return child.execBlock(s.Body)
 		}
 		if s.Else != nil {
-			return f.execStmt(s.Else)
+			return child.execStmt(s.Else)
 		}
 		return flow{}, nil
 	case *ast.ForStmt:
@@ -231,10 +236,10 @@ func (f *frame) assign(lhs ast.Expr, value any, define bool) error {
 			return nil
 		}
 		typ := f.rt.checked.Info.TypeOf(x)
+		_, isNew := f.rt.checked.Info.Defs[x]
+		define = define && isNew
 		if define {
-			if obj := f.rt.checked.Info.Defs[x]; obj != nil {
-				typ = obj.Type()
-			}
+			typ = f.rt.checked.Info.Defs[x].Type()
 		}
 		if typ != nil {
 			converted, err := convertToType(value, typ)
