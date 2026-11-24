@@ -207,6 +207,9 @@ func (rt *Runtime) bindImports() error {
 			alias := ""
 			if spec.Name != nil {
 				alias = spec.Name.Name
+			} else if pkgName, ok := rt.checked.Info.Implicits[spec].(*types.PkgName); ok {
+				// Import paths do not necessarily end with the package name.
+				alias = pkgName.Imported().Name()
 			} else {
 				parts := strings.Split(path, "/")
 				alias = parts[len(parts)-1]
