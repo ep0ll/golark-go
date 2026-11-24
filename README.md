@@ -163,6 +163,69 @@ A native facade should expose only the capabilities scripts are allowed to
 use. Static typing does not make a native function safe: the host remains
 responsible for the behavior of every function and value it registers.
 
+## Runnable examples
+
+The repository includes focused, standalone embedding examples. Run any of them
+from the repository root with `go run ./examples/<name>`.
+
+| Example | Demonstrates |
+| --- | --- |
+| [basic](examples/basic/main.go) | Parse, execute, and call a root-package function. |
+| [dynamic-resolver](examples/dynamic-resolver/main.go) | Resolve import paths dynamically from an application-owned registry, including transitive imports. |
+| [native-package](examples/native-package/main.go) | Register a native package with explicit `go/types` declarations and matching runtime bindings. |
+| [mixed-packages](examples/mixed-packages/main.go) | Combine source-backed packages and native packages in one import graph, including a native dependency imported by a source package. |
+
+### Dynamic package resolution
+
+A resolver can be backed by a map, database, tenant-specific registry, embedded
+asset bundle, cache, or another application-controlled source. It receives the
+exact import path requested by the script and returns source bytes:
+
+```go
+resolver := golark.ResolverFunc(func(
+    ctx context.Context,
+    importPath string,
+) (golark.PackageSource, error) {
+    if err := ctx.Err(); err != nil {
+        return golark.PackageSource{}, err
+    }
+
+    source, ok := registry[importPath]
+    if !ok {
+        return golark.PackageSource{}, golark.ErrPackageNotFound
+    }
+    return source, nil
+})
+```
+
+"Unknown package" is not an automatic download instruction. It means the
+resolver receives an import path that is not known to the root source, and the
+embedding application decides whether that path is registered, authorized,
+and available. Returning `ErrPackageNotFound` permits native-importer fallback;
+returning any other error stops resolution. A resolver may compose multiple
+registries (for example tenant packages first, then shared packages), but it
+should enforce its own allowlist and trust policy.
+
+### Native package registration
+
+Native packages have a static half and a runtime half:
+
+1. The `types.Importer` returns a completed `*types.Package` describing the
+   exported names and exact signatures visible to `go/types`.
+2. `Options.Imports` maps those same exported names to runtime
+   `golark.Binding` values.
+
+The example builds the package metadata with `go/types.NewPackage`,
+`types.NewFunc`, and `types.NewSignatureType`. This is useful when the host
+wants to expose a narrow facade over a much larger Go package. Do not expose a
+package's full API by default: each registered native function is a host
+capability and can perform whatever operations its implementation allows.
+
+The combined example demonstrates the resolution order: Golark asks the
+source resolver first; if it returns `ErrPackageNotFound`, Golark asks the
+native importer. The same rule applies to transitive imports. The native
+importer should return stable package objects for each import path.
+
 ## Architecture
 
 ```text
