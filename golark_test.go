@@ -3,6 +3,7 @@ package golark_test
 import (
 	"context"
 	"errors"
+	"go/importer"
 	"strings"
 	stdstrings "strings"
 	"testing"
@@ -217,7 +218,7 @@ func TestRuntimeImportFacade(t *testing.T) {
 	module, err := golark.Exec(context.Background(), "imports.go", []byte(`package config
 import "strings"
 func Normalize(value string) string { return strings.TrimSpace(value) }
-`), golark.Options{Imports: map[string]map[string]golark.Binding{
+`), golark.Options{Importer: importer.Default(), Imports: map[string]map[string]golark.Binding{
 		"strings": {"TrimSpace": golark.Bind(stdstrings.TrimSpace)},
 	}})
 	if err != nil {
@@ -304,5 +305,84 @@ func Scope() int {
 	}
 	if got[0] != 1 {
 		t.Fatalf("Scope() = %#v, want outer value 1", got)
+	}
+}
+
+
+func TestResolverLoadsTransitivePackagesOnceAndPreservesTypeIdentity(t *testing.T) {
+	calls := make(map[string]int)
+	resolver := golark.ResolverFunc(func(ctx context.Context, importPath string) (golark.PackageSource, error) {
+		calls[importPath]++
+		switch importPath {
+		case "example.com/alpha":
+			return golark.PackageSource{Files: map[string][]byte{
+				"alpha.go": []byte(`package alpha
+import "example.com/shared"
+func RoundTrip(value shared.ID) shared.ID { return shared.Identity(value) }
+`),
+			}}, nil
+		case "example.com/shared":
+			return golark.PackageSource{Files: map[string][]byte{
+				"shared.go": []byte(`package shared
+type ID int
+func Identity(value ID) ID { return value }
+`),
+			}}, nil
+		default:
+			return golark.PackageSource{}, golark.ErrPackageNotFound
+		}
+	})
+
+	module, err := golark.Exec(context.Background(), "root.go", []byte(`package config
+import (
+    "example.com/alpha"
+    "example.com/shared"
+)
+func Run(value shared.ID) shared.ID { return alpha.RoundTrip(value) }
+`), golark.Options{Resolver: resolver})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if calls["example.com/alpha"] != 1 || calls["example.com/shared"] != 1 {
+		t.Fatalf("resolver calls = %#v, want each package resolved once", calls)
+	}
+	got, err := module.Call(context.Background(), "Run", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != 42 {
+		t.Fatalf("Run() = %#v, want 42", got)
+	}
+}
+
+func TestResolverDetectsImportCycles(t *testing.T) {
+	resolver := golark.ResolverFunc(func(ctx context.Context, importPath string) (golark.PackageSource, error) {
+		switch importPath {
+		case "example.com/a":
+			return golark.PackageSource{Files: map[string][]byte{
+				"a.go": []byte("package a\nimport \"example.com/b\"\nfunc A() int { return b.B() }\n"),
+			}}, nil
+		case "example.com/b":
+			return golark.PackageSource{Files: map[string][]byte{
+				"b.go": []byte("package b\nimport \"example.com/a\"\nfunc B() int { return a.A() }\n"),
+			}}, nil
+		default:
+			return golark.PackageSource{}, golark.ErrPackageNotFound
+		}
+	})
+	_, err := golark.Exec(context.Background(), "root.go", []byte("package config\nimport \"example.com/a\"\nfunc Run() int { return a.A() }\n"), golark.Options{Resolver: resolver})
+	if err == nil || !strings.Contains(err.Error(), "import cycle") {
+		t.Fatalf("expected import cycle error, got %v", err)
+	}
+}
+
+func TestResolverNotFoundDoesNotDiscoverPackagesImplicitly(t *testing.T) {
+	resolver := golark.ResolverFunc(func(ctx context.Context, importPath string) (golark.PackageSource, error) {
+		return golark.PackageSource{}, golark.ErrPackageNotFound
+	})
+	_, err := golark.Exec(context.Background(), "root.go", []byte("package config\nimport \"example.com/missing\"\nfunc Run() {}\n"), golark.Options{Resolver: resolver})
+	if !errors.Is(err, golark.ErrPackageNotFound) {
+		t.Fatalf("expected ErrPackageNotFound, got %v", err)
 	}
 }
