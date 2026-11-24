@@ -285,3 +285,24 @@ func Runes(value string) []rune { result := []rune{}; for _, r := range value { 
 		t.Fatalf("Runes() = %#v", actualRunes)
 	}
 }
+
+
+func TestIfInitHasItsOwnScope(t *testing.T) {
+	module, err := golark.Exec(context.Background(), "if-scope.go", []byte(`package config
+func Scope() int {
+    value := 1
+    if value := 2; value == 2 { value = 3 }
+    return value
+}
+`), golark.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := module.Call(context.Background(), "Scope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0] != 1 {
+		t.Fatalf("Scope() = %#v, want outer value 1", got)
+	}
+}
