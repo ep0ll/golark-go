@@ -301,7 +301,9 @@ func (rt *Runtime) callValue(ctx context.Context, callable any, args []any) (any
 	}
 	switch fn := callable.(type) {
 	case *Function:
-		return rt.callFunction(ctx, fn, args)
+		// Imported script functions must execute with the Runtime that owns
+		// their AST, type information, globals, and execution budget.
+		return fn.rt.callFunction(ctx, fn, args)
 	case reflect.Value:
 		return callReflect(ctx, fn, args)
 	default:

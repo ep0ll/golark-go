@@ -1,8 +1,8 @@
 // Package golark embeds a statically typed Go-like configuration language.
 //
-// Golark deliberately reuses Go's own syntax tree, parser, formatter, and type
-// checker. A checked program is then executed by Golark's evaluator, allowing
-// applications to expose typed Go functions and values to scripts.
+// Golark reuses Go's syntax tree, parser, formatter, and type checker. A
+// checked package graph is executed by Golark's evaluator, allowing
+// applications to provide imported source packages and typed native bindings.
 package golark
 
 import (
@@ -15,6 +15,7 @@ import (
 
 	"github.com/ep0ll/golark-go/internal/checker"
 	"github.com/ep0ll/golark-go/internal/eval"
+	"github.com/ep0ll/golark-go/internal/loader"
 	"github.com/ep0ll/golark-go/internal/syntax"
 )
 
@@ -25,18 +26,37 @@ type Binding = checker.Binding
 // Bind creates a statically typed binding from a Go value.
 func Bind(value any) Binding { return checker.Bind(value) }
 
-// Options configures parsing, checking, and execution.
+// PackageSource is the in-memory source for one imported Go package.
+type PackageSource = loader.PackageSource
+
+// PackageResolver resolves import paths to source packages. It is invoked by
+// one Exec operation for every source-backed direct or transitive import.
+type PackageResolver = loader.PackageResolver
+
+// ResolverFunc adapts a function to PackageResolver.
+type ResolverFunc = loader.ResolverFunc
+
+// ErrPackageNotFound asks Golark to try Options.Importer for an import path.
+var ErrPackageNotFound = loader.ErrPackageNotFound
+
+// Options configures parsing, type checking, package resolution, and execution.
 type Options struct {
-	// PackagePath is the import path assigned to the script package. When empty,
-	// Golark uses golark.local/<package-name>.
+	// PackagePath is the import path assigned to the root script package. When
+	// empty, Golark uses golark.local/<package-name>.
 	PackagePath string
-	// Importer resolves packages referenced by Go import declarations. The
-	// default is go/importer.Default, which resolves installed Go packages.
+	// Resolver supplies in-memory Go source for imported packages. The same
+	// resolver is used for transitive imports, and each import path is resolved
+	// at most once during one Check or Exec operation.
+	Resolver PackageResolver
+	// Importer supplies type information for native/type-only packages. Source
+	// packages returned by Resolver take precedence. If nil, unresolved imports
+	// fail rather than being discovered through Go modules or the filesystem.
 	Importer types.Importer
-	// Predeclared exposes host values as package-level identifiers.
+	// Predeclared exposes host values as package-level identifiers in the root
+	// script package.
 	Predeclared map[string]Binding
-	// Imports supplies runtime values for packages imported by the source,
-	// keyed by the exact import path and then exported identifier.
+	// Imports supplies runtime values for native packages, keyed by exact
+	// import path and exported identifier. Static types come from Importer.
 	Imports map[string]map[string]Binding
 	// MaxSteps bounds interpreted execution. Zero selects the default budget.
 	MaxSteps int64
@@ -45,8 +65,11 @@ type Options struct {
 // Program is a parsed Go package. Its syntax is standard Go syntax.
 type Program struct{ parsed *checker.Program }
 
-// CheckedProgram is a Program that has passed Go's static type checker.
-type CheckedProgram struct{ checked *checker.Checked }
+// CheckedProgram is a Program and its complete, type-checked source package graph.
+type CheckedProgram struct {
+	checked *checker.Checked
+	graph   *loader.Graph
+}
 
 // Module is an initialized script package.
 type Module struct{ module *eval.Module }
@@ -55,7 +78,9 @@ type Module struct{ module *eval.Module }
 type LexToken = syntax.Token
 
 // Lex tokenizes source using go/scanner and returns source positions.
-func Lex(filename string, source []byte) ([]LexToken, error) { return syntax.Lex(filename, source) }
+func Lex(filename string, source []byte) ([]LexToken, error) {
+	return syntax.Lex(filename, source)
+}
 
 // ParseExpr parses a single Go expression using go/parser.
 func ParseExpr(filename string, source []byte) (ast.Expr, error) {
@@ -101,19 +126,31 @@ func ParseFiles(files map[string][]byte) (*Program, error) {
 	return &Program{parsed: &checker.Program{Fset: fset, Files: parsed}}, nil
 }
 
-// Check performs Go static type checking with go/types.
+// Check performs Go static type checking for the root package and every
+// source-backed direct or transitive import. All packages share one importer
+// cache and token.FileSet.
 func Check(program *Program, options Options) (*CheckedProgram, error) {
+	return check(context.Background(), program, options)
+}
+
+func check(ctx context.Context, program *Program, options Options) (*CheckedProgram, error) {
 	if program == nil {
 		return nil, fmt.Errorf("golark: nil program")
 	}
-	checked, err := checker.Check(program.parsed, checker.Options{PackagePath: options.PackagePath, Importer: options.Importer, Predeclared: options.Predeclared})
+	graph, err := loader.Load(ctx, program.parsed, loader.Options{
+		PackagePath: options.PackagePath,
+		Resolver:    options.Resolver,
+		Importer:    options.Importer,
+		Predeclared: options.Predeclared,
+	})
 	if err != nil {
 		return nil, err
 	}
-	return &CheckedProgram{checked: checked}, nil
+	return &CheckedProgram{checked: graph.Root(), graph: graph}, nil
 }
 
-// Exec parses, type-checks, and initializes one source file.
+// Exec parses, type-checks the complete package graph, initializes imported
+// source packages in dependency order, then initializes the root package.
 func Exec(ctx context.Context, filename string, source []byte, options Options) (*Module, error) {
 	program, err := Parse(filename, source)
 	if err != nil {
@@ -122,21 +159,74 @@ func Exec(ctx context.Context, filename string, source []byte, options Options) 
 	return Execute(ctx, program, options)
 }
 
-// Execute type-checks and initializes a previously parsed package.
+// Execute type-checks and initializes a previously parsed package and its
+// complete source-backed import graph.
 func Execute(ctx context.Context, program *Program, options Options) (*Module, error) {
-	checked, err := Check(program, options)
+	checked, err := check(ctx, program, options)
 	if err != nil {
 		return nil, err
 	}
-	runtime, err := eval.New(checked.checked, eval.Options{Predeclared: options.Predeclared, Imports: options.Imports, MaxSteps: options.MaxSteps})
-	if err != nil {
-		return nil, err
+
+	imports := cloneImports(options.Imports)
+	var root *eval.Module
+	for _, pkg := range checked.graph.Packages() {
+		predeclared := map[string]checker.Binding(nil)
+		if pkg == checked.checked {
+			predeclared = options.Predeclared
+		}
+		runtime, err := eval.New(pkg, eval.Options{
+			Predeclared: predeclared,
+			Imports:     imports,
+			MaxSteps:    options.MaxSteps,
+		})
+		if err != nil {
+			return nil, err
+		}
+		module, err := runtime.Init(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("initialize package %q: %w", pkg.Package.Path(), err)
+		}
+		imports[pkg.Package.Path()] = runtimeBindings(pkg, module)
+		if pkg == checked.checked {
+			root = module
+		}
 	}
-	module, err := runtime.Init(ctx)
-	if err != nil {
-		return nil, err
+	if root == nil {
+		return nil, fmt.Errorf("golark: package graph did not initialize its root")
 	}
-	return &Module{module: module}, nil
+	return &Module{module: root}, nil
+}
+
+func cloneImports(source map[string]map[string]checker.Binding) map[string]map[string]checker.Binding {
+	out := make(map[string]map[string]checker.Binding, len(source))
+	for path, bindings := range source {
+		copyBindings := make(map[string]checker.Binding, len(bindings))
+		for name, binding := range bindings {
+			copyBindings[name] = binding
+		}
+		out[path] = copyBindings
+	}
+	return out
+}
+
+// runtimeBindings exposes only exported package-level values. Named types
+// remain represented by the exact *types.Package graph used during checking.
+func runtimeBindings(checked *checker.Checked, module *eval.Module) map[string]checker.Binding {
+	out := make(map[string]checker.Binding)
+	for _, name := range checked.Package.Scope().Names() {
+		if !token.IsExported(name) {
+			continue
+		}
+		object := checked.Package.Scope().Lookup(name)
+		switch object.(type) {
+		case *types.Const, *types.Func, *types.Var:
+			value, ok := module.Lookup(name)
+			if ok {
+				out[name] = checker.Binding{Value: value, Type: object.Type()}
+			}
+		}
+	}
+	return out
 }
 
 // ExecFile reads, parses, checks, and initializes a source file.
@@ -189,12 +279,26 @@ func (p *Program) AST() []*ast.File {
 	return append([]*ast.File(nil), p.parsed.Files...)
 }
 
-// Types returns the checked package and type information.
+// Types returns the checked root package and its type information.
 func (p *CheckedProgram) Types() (*types.Package, *types.Info) {
 	if p == nil || p.checked == nil {
 		return nil, nil
 	}
 	return p.checked.Package, p.checked.Info
+}
+
+// Packages returns source-backed packages in dependency-first order, including
+// the root. Every import path in the graph has one stable type identity.
+func (p *CheckedProgram) Packages() []*types.Package {
+	if p == nil || p.graph == nil {
+		return nil
+	}
+	checked := p.graph.Packages()
+	out := make([]*types.Package, 0, len(checked))
+	for _, pkg := range checked {
+		out = append(out, pkg.Package)
+	}
+	return out
 }
 
 // Format formats a parsed program using go/format.
